@@ -33,13 +33,13 @@ To properly test the network detection layers, you'll need two separate machines
 
 ## Current Status
 
-The core backend packet capture modules and the frontend alert dashboard structure are present. Some advanced correlation features and built-in self-testing capabilities remain actively under development or missing from the current branch.
+The core backend packet capture modules and the frontend alert dashboard are fully functional. Some advanced correlation features and built-in self-testing capabilities remain actively under development or missing from the current branch. The browser extension remains a structural placeholder at this time.
 
 ## Project Areas
 
 - `backend/`: Flask backend for packet capture, network detection modules, and alert APIs
 - `extension/`: Browser extension scaffold for phishing and credential-harvesting detection
-- `frontend/`: React dashboard scaffold for unified alert monitoring
+- `frontend/`: Working alternate browser-based React dashboard with live API polling and desktop notifications
 - `netshield_gui.py`: Desktop GUI application for running NetShield
 
 ## Prerequisites
