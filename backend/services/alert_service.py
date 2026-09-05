@@ -47,12 +47,20 @@ class AlertService:
                 continue
             score = group.get("score")
             reason = group.get("reason", "")
-            timestamps = [
-                access_points[bssid]["last_seen"]
+            # Anchor to when the group became detectable. last_seen is rewritten on
+            # every poll, so using it mints a new alert id each cycle, which re-fires
+            # GUI toasts and the high-risk disconnect prompt for the same evil twin.
+            first_seen_values = [
+                access_points[bssid]["first_seen"]
                 for bssid in bssids
-                if bssid in access_points and access_points[bssid].get("last_seen")
+                if bssid in access_points and access_points[bssid].get("first_seen")
             ]
-            timestamp = max(timestamps) if timestamps else snapshot.get("started_at")
+            started_at = snapshot.get("started_at") or ""
+            timestamp = max(first_seen_values) if first_seen_values else started_at
+            if started_at and timestamp < started_at:
+                # Group predates this session; report it at session start so it
+                # still reads as active.
+                timestamp = started_at
             description_parts = [
                 f"SSID '{ssid}' is being broadcast by multiple BSSIDs ({', '.join(bssids)}).",
             ]

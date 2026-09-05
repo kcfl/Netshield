@@ -45,6 +45,7 @@ class PacketSniffer:
         self._traffic_interface: Optional[str] = None
         self._connected_ssid: Optional[str] = None
         self._connected_ssid_error: Optional[str] = None
+        self._interface_mismatch_error: Optional[str] = None
         self._stop_event = Event()
         self._running = False
         self._last_error: Optional[str] = None
@@ -68,6 +69,8 @@ class PacketSniffer:
         self._ssl_canary_url = Config.SSL_CANARY_URL
         self._ssl_canary_interval = Config.SSL_CANARY_INTERVAL
         self._ssl_canary_pin_path = Path(Config.SSL_CANARY_PIN_PATH)
+        self._ssl_canary_pin_max_age_days = Config.SSL_CANARY_PIN_MAX_AGE_DAYS
+        self._ssl_pin_created_at: Optional[str] = None
         self._ssl_pinned_fingerprint = self._load_ssl_canary_pin()
         self._last_ssl_canary_result: Dict[str, Any] = {
             "status": "pending_pin" if not self._ssl_pinned_fingerprint else "pin_loaded",
@@ -107,25 +110,33 @@ class PacketSniffer:
                 return
 
             try:
-                self._stop_event.clear()
+                # A fresh event per session. A worker that outlived stop()'s join
+                # timeout still holds the previous session's event, which stays set,
+                # so it exits instead of rejoining the new session.
+                stop_event = Event()
+                self._stop_event = stop_event
                 self._interface = self._requested_interface
                 self._running = True
                 self._last_error = None
                 self._started_at = self._utc_now()
+                self._reset_session_detection_state_locked()
                 self._worker = Thread(
                     target=self._poll_loop,
+                    args=(stop_event,),
                     name="netshield-wifi-poller",
                     daemon=True,
                 )
                 self._worker.start()
                 self._traffic_monitor_worker = Thread(
                     target=self._start_traffic_monitor,
+                    args=(stop_event,),
                     name="netshield-traffic-bootstrap",
                     daemon=True,
                 )
                 self._traffic_monitor_worker.start()
                 self._ssl_canary_worker = Thread(
                     target=self._ssl_canary_loop,
+                    args=(stop_event,),
                     name="netshield-ssl-canary",
                     daemon=True,
                 )
@@ -205,6 +216,7 @@ class PacketSniffer:
                 "ssl_canary_status": dict(self._last_ssl_canary_result),
                 "connected_ssid_error": self._connected_ssid_error or "",
                 "arp_spoof": self._build_arp_status(),
+                "interface_status": self._build_interface_status(),
                 "trust_score": trust_info["trust_score"],
                 "trust_factors": trust_info["factors"],
             }
@@ -240,6 +252,7 @@ class PacketSniffer:
                 "connected_ssid_error": self._connected_ssid_error or "",
                 "arp_spoof": self._build_arp_status(),
                 "ssl_strip": self._build_ssl_strip_status(),
+                "interface_status": self._build_interface_status(),
                 "trust_score": trust_info["trust_score"],
                 "trust_factors": trust_info["factors"],
             }
@@ -268,6 +281,9 @@ class PacketSniffer:
                 elif ssl_status == "error":
                     score -= 20
                     factors.append("SSL Canary error (-20)")
+                elif ssl_status == "pin_stale":
+                    score -= 10
+                    factors.append("SSL Canary pin expired - re-pin required (-10)")
                 elif ssl_status in {"pin_delayed", "pending_pin"}:
                     score -= 10
                     factors.append("SSL Canary pending or delayed (-10)")
@@ -288,13 +304,17 @@ class PacketSniffer:
                 score -= 10
                 factors.append("SSID Scanner error/paused (-10)")
 
+            if self._interface_mismatch_error:
+                score -= 10
+                factors.append("Capture interface differs from scanned network (-10)")
+
             if not factors:
                 factors.append("Perfect condition")
 
             return {"trust_score": max(0, score), "factors": factors}
 
-    def _poll_loop(self) -> None:
-        while not self._stop_event.is_set():
+    def _poll_loop(self, stop_event: Event) -> None:
+        while not stop_event.is_set():
             try:
                 scan_result = self._scan_access_points()
                 self._apply_scan_results(scan_result)
@@ -306,10 +326,10 @@ class PacketSniffer:
                 self._runtime_logger.exception("Wi-Fi poller iteration failed.")
 
             self._log_wifi_poller_heartbeat()
-            self._stop_event.wait(self._poll_interval)
+            stop_event.wait(self._poll_interval)
 
-    def _ssl_canary_loop(self) -> None:
-        while not self._stop_event.is_set():
+    def _ssl_canary_loop(self, stop_event: Event) -> None:
+        while not stop_event.is_set():
             # Wait for network to settle before checking canary
             # Also avoid the race condition where Canary runs before the first Wi-Fi poll completes
             with self._lock:
@@ -318,10 +338,10 @@ class PacketSniffer:
             now = monotonic()
 
             if not ssid_initialized:
-                self._stop_event.wait(1.0)
+                stop_event.wait(1.0)
                 continue
             elif suppress_until > now:
-                self._stop_event.wait(suppress_until - now)
+                stop_event.wait(suppress_until - now)
                 continue
 
             if not self._get_current_canary_pin():
@@ -336,7 +356,7 @@ class PacketSniffer:
                 self._last_ssl_canary_result = dict(check_result)
 
             self._log_ssl_canary_heartbeat(check_result)
-            self._stop_event.wait(max(1, int(self._ssl_canary_interval)))
+            stop_event.wait(max(1, int(self._ssl_canary_interval)))
 
     def reset_ssl_canary_pin(self) -> Dict[str, Any]:
         try:
@@ -346,6 +366,7 @@ class PacketSniffer:
 
         with self._lock:
             self._ssl_pinned_fingerprint = None
+            self._ssl_pin_created_at = None
             self._last_ssl_canary_result = {
                 "status": "pending_pin",
                 "fingerprint": None,
@@ -360,13 +381,23 @@ class PacketSniffer:
         )
         return self.get_scan_status()
 
+    def _reset_session_detection_state_locked(self) -> None:
+        """Reset per-session detection state so a repeat threat is reported again.
+
+        Dedup signatures and IP-to-MAC bindings are active-session state. Carrying
+        signatures across Start Scan would silently suppress a recurring spoof, and
+        carrying bindings would leave a spoofed MAC as the trusted baseline. Event
+        history is left intact so the Live Alert Feed keeps it. Call with the lock held.
+        """
+        self._arp_spoof_signatures.clear()
+        self._ssl_strip_signatures.clear()
+        self._ip_mac_bindings.clear()
+
     def reset_debug_test_state(self) -> Dict[str, Any]:
         with self._lock:
-            self._ip_mac_bindings.clear()
             self._arp_spoof_events.clear()
-            self._arp_spoof_signatures.clear()
             self._ssl_strip_events.clear()
-            self._ssl_strip_signatures.clear()
+            self._reset_session_detection_state_locked()
 
         self._runtime_logger.info(
             "debug test state cleared: arp spoof and ssl strip event history/signatures reset; ssl-canary pin preserved"
@@ -519,6 +550,30 @@ class PacketSniffer:
 
         return last_result
 
+    def _is_ssl_pin_stale(self) -> bool:
+        """True when the pin is too old to tell certificate rotation from interception.
+
+        An unknown or unparseable pin date counts as stale: we cannot establish
+        freshness, so we must not claim a mismatch is an attack.
+        """
+        with self._lock:
+            pinned_at = self._ssl_pin_created_at
+            max_age_days = self._ssl_canary_pin_max_age_days
+
+        if not pinned_at:
+            return True
+
+        try:
+            pinned_dt = datetime.fromisoformat(str(pinned_at).replace("Z", "+00:00"))
+        except ValueError:
+            return True
+
+        if pinned_dt.tzinfo is None:
+            pinned_dt = pinned_dt.replace(tzinfo=timezone.utc)
+
+        age_days = (datetime.now(timezone.utc) - pinned_dt).total_seconds() / 86400.0
+        return age_days > max_age_days
+
     def _run_ssl_canary_check(self) -> Dict[str, Any]:
         expected_fingerprint = (self._get_current_canary_pin() or "").strip().lower()
         result = self._probe_ssl_canary_endpoint()
@@ -526,8 +581,18 @@ class PacketSniffer:
         result["pin_path"] = str(self._ssl_canary_pin_path)
 
         if result["status"] == "ok" and result["fingerprint"] != expected_fingerprint:
-            result["status"] = "fingerprint_mismatch"
-            result["error"] = "presented certificate fingerprint does not match pinned value"
+            if self._is_ssl_pin_stale():
+                # Indistinguishable from routine rotation at this pin age, so ask for
+                # a re-pin rather than reporting an attack we cannot substantiate.
+                result["status"] = "pin_stale"
+                result["error"] = (
+                    f"pinned certificate is older than {self._ssl_canary_pin_max_age_days} days and no "
+                    "longer matches; this is consistent with routine certificate rotation — use "
+                    "Repin SSL Canary to re-establish trust"
+                )
+            else:
+                result["status"] = "fingerprint_mismatch"
+                result["error"] = "presented certificate fingerprint does not match pinned value"
 
         return result
 
@@ -544,6 +609,7 @@ class PacketSniffer:
             pinned_endpoint = payload.get("endpoint")
             if pinned_endpoint:
                 self._ssl_canary_url = pinned_endpoint
+            self._ssl_pin_created_at = payload.get("pinned_at")
 
             self._runtime_logger.info(
                 "ssl-canary loaded pinned fingerprint=%s endpoint=%s path=%s",
@@ -558,10 +624,12 @@ class PacketSniffer:
 
     def _persist_ssl_canary_pin(self, fingerprint: str) -> None:
         self._ssl_canary_pin_path.parent.mkdir(parents=True, exist_ok=True)
+        pinned_at = self._utc_now()
+        self._ssl_pin_created_at = pinned_at
         payload = {
             "fingerprint": fingerprint,
             "endpoint": self._ssl_canary_url,
-            "pinned_at": self._utc_now(),
+            "pinned_at": pinned_at,
         }
         self._ssl_canary_pin_path.write_text(
             json.dumps(payload, indent=2),
@@ -578,13 +646,16 @@ class PacketSniffer:
 
         if check_result.get("status") == "no_tls":
             description = (
-                f"Possible SSL stripping / MITM: TLS connection to {hostname} failed "
-                f"(endpoint={endpoint}). Error: {error}"
+                f"Reason: The TLS handshake with {hostname} (endpoint={endpoint}) failed: {error} "
+                "— an expected HTTPS endpoint served no TLS, consistent with a downgrade on "
+                "the network path."
             )
         else:
             description = (
-                f"Possible SSL stripping / MITM: certificate pin mismatch for {hostname} "
-                f"(endpoint={endpoint}). Expected={expected or 'unset'} Observed={fingerprint or 'none'}."
+                f"Reason: The certificate presented by {hostname} (endpoint={endpoint}) does not "
+                f"match the pinned fingerprint (expected={expected or 'unset'}, "
+                f"observed={fingerprint or 'none'}) — a substituted certificate on a pinned "
+                "endpoint is consistent with TLS interception."
             )
 
         signature = (hostname, f"ssl-canary:{check_result.get('status')}:{fingerprint or error}")
@@ -753,7 +824,10 @@ class PacketSniffer:
             self._interface = interface or self._interface
             
             new_ssid = self._get_connected_ssid()
-            if new_ssid != self._connected_ssid:
+            # Only a change between observed networks settles; the first poll of a
+            # session has no previous SSID to have moved away from, and suppressing
+            # there costs 10s of ARP blindness and a trust deduction for nothing.
+            if self._connected_ssid is not None and new_ssid != self._connected_ssid:
                 self._ip_mac_bindings.clear()
                 self._arp_suppress_until = monotonic() + 10.0
                 
@@ -767,6 +841,7 @@ class PacketSniffer:
                     self._runtime_logger.info(f"Connected SSID detected: {new_ssid} — evil-twin evaluation resumed")
                     self._connected_ssid_error = None
             self._connected_ssid = new_ssid
+            self._refresh_interface_coherence_locked()
 
             updated_access_points: Dict[str, Dict[str, Any]] = {}
             updated_ssid_index: dict[str, set[str]] = defaultdict(set)
@@ -804,7 +879,7 @@ class PacketSniffer:
             self._ssid_index = updated_ssid_index
             self._refresh_evil_twin_flags_locked()
 
-    def _start_traffic_monitor(self) -> None:
+    def _start_traffic_monitor(self, stop_event: Event) -> None:
         if AsyncSniffer is None or get_working_if is None:
             with self._lock:
                 self._traffic_monitor_error = f"Scapy is unavailable: {SCAPY_IMPORT_ERROR}"
@@ -812,7 +887,7 @@ class PacketSniffer:
             return
 
         try:
-            if self._stop_event.is_set():
+            if stop_event.is_set():
                 return
 
             interface = self._resolve_capture_interface()
@@ -825,7 +900,7 @@ class PacketSniffer:
             self._runtime_logger.info("Scapy traffic monitor started on interface=%s alive", interface)
 
             with self._lock:
-                if self._stop_event.is_set() or not self._running:
+                if stop_event.is_set() or not self._running:
                     try:
                         sniffer.stop()
                     except Exception:
@@ -907,8 +982,10 @@ class PacketSniffer:
                             "observed_mac": mac_address,
                             "severity": "high",
                             "description": (
-                                f"ARP spoofing suspected: {ip_address} was first mapped to "
-                                f"{previous_mapping['mac']} and is now claimed by {mac_address}."
+                                f"Reason: IP {ip_address} was previously mapped to MAC "
+                                f"{previous_mapping['mac']} but is now claimed by {mac_address} "
+                                "— a device on the network is impersonating another host, "
+                                "consistent with ARP cache poisoning."
                             ),
                             "last_seen": now,
                         }
@@ -942,15 +1019,19 @@ class PacketSniffer:
 
         now = self._utc_now()
         request_target = request_line.split(" ")[1] if " " in request_line else "/"
+        # Drop query and fragment before this value is stored or described: they can
+        # carry tokens or personal data that would then live forever in the alert
+        # feed, and cache-busting params would each mint a fresh dedup signature.
+        request_path = request_target.split("?", 1)[0].split("#", 1)[0] or "/"
 
         # Ignore OCSP traffic (HTTP by design)
-        if "/ocsp/" in request_target.lower():
+        if "/ocsp/" in request_path.lower():
             return
         content_type_match = re.search(r"(?im)^Content-Type:\s*(.+)", payload_text)
         if content_type_match and "application/ocsp-request" in content_type_match.group(1).lower():
             return
 
-        signature = (host, request_target)
+        signature = (host, request_path)
 
         with self._lock:
             if signature in self._ssl_strip_signatures:
@@ -960,16 +1041,67 @@ class PacketSniffer:
             self._ssl_strip_events.append(
                 {
                     "host": host,
-                    "path": request_target,
+                    "path": request_path,
                     "severity": "medium",
                     "description": (
-                        f"Possible SSL stripping: observed an HTTP request to {host}{request_target} "
-                        "even though the domain is expected to use HTTPS."
+                        f"Reason: Connection to {host}{request_path} was made over plain HTTP "
+                        "even though this domain is expected to use HTTPS — the network path "
+                        "may be intercepted."
                     ),
                     "last_seen": now,
                 }
             )
             self._ssl_strip_events = self._ssl_strip_events[-25:]
+
+    def _refresh_interface_coherence_locked(self) -> None:
+        """Flag when packet capture is bound to a different NIC than the Wi-Fi scan.
+
+        With two live adapters (Wi-Fi plus a USB tether, say) scapy can bind to the
+        one the Wi-Fi scanner is not watching, leaving ARP and SSL-strip monitoring
+        silently covering a different network. Call with self._lock held.
+        """
+        scan_interface = (self._interface or "").strip()
+        capture_interface = (self._traffic_interface or "").strip()
+
+        if not scan_interface or not capture_interface:
+            mismatch = None
+        elif scan_interface.casefold() == capture_interface.casefold():
+            mismatch = None
+        else:
+            mismatch = (
+                f"Wi-Fi scanning covers '{scan_interface}' but packet capture is bound to "
+                f"'{capture_interface}' - ARP and SSL-strip monitoring do not apply to the "
+                "scanned network."
+            )
+
+        if mismatch == self._interface_mismatch_error:
+            return
+
+        if mismatch:
+            self._runtime_logger.warning(mismatch)
+        elif scan_interface and capture_interface:
+            self._runtime_logger.info(
+                "interface coherence restored: scan and capture both on '%s'", scan_interface
+            )
+        self._interface_mismatch_error = mismatch
+
+    def _build_interface_status(self) -> Dict[str, Any]:
+        mismatch = self._interface_mismatch_error
+
+        if mismatch:
+            description = mismatch
+        elif self._interface and self._traffic_interface:
+            description = f"Wi-Fi scanning and packet capture are both on '{self._interface}'."
+        else:
+            description = "Interface coherence has not been determined yet."
+
+        return {
+            "coherent": not mismatch,
+            "severity": "medium" if mismatch else "none",
+            "scan_interface": self._interface,
+            "capture_interface": self._traffic_interface,
+            "description": description,
+        }
 
     def _refresh_evil_twin_flags_locked(self) -> None:
         evaluated_groups = []
@@ -1326,10 +1458,15 @@ class PacketSniffer:
         return str(severity or "").strip().lower() in {"medium", "high", "critical"}
 
     def _build_arp_status(self) -> Dict[str, Any]:
+        # events carries full history for the Live Alert Feed; detected/severity
+        # describe the current session only, matching _calculate_trust_score().
         events = [dict(event) for event in self._arp_spoof_events]
+        active_events = [
+            event for event in events if self._is_active_event(event.get("last_seen", ""))
+        ]
         is_suppressed = monotonic() < getattr(self, "_arp_suppress_until", 0.0)
 
-        if self._traffic_monitor_error and not events:
+        if self._traffic_monitor_error and not active_events:
             return {
                 "detected": False,
                 "severity": "info",
@@ -1341,8 +1478,8 @@ class PacketSniffer:
                 "suppressed": is_suppressed,
             }
 
-        if events:
-            latest_event = events[-1]
+        if active_events:
+            latest_event = active_events[-1]
             return {
                 "detected": True,
                 "severity": "high",
@@ -1354,15 +1491,18 @@ class PacketSniffer:
         return {
             "detected": False,
             "severity": "none",
-            "description": "No conflicting ARP IP-to-MAC claims have been observed.",
+            "description": "No conflicting ARP IP-to-MAC claims have been observed in this session.",
             "events": events,
             "suppressed": is_suppressed,
         }
 
     def _build_ssl_strip_status(self) -> Dict[str, Any]:
         events = [dict(event) for event in self._ssl_strip_events]
+        active_events = [
+            event for event in events if self._is_active_event(event.get("last_seen", ""))
+        ]
 
-        if self._traffic_monitor_error and not events:
+        if self._traffic_monitor_error and not active_events:
             return {
                 "detected": False,
                 "severity": "info",
@@ -1373,8 +1513,8 @@ class PacketSniffer:
                 "events": events,
             }
 
-        if events:
-            latest_event = events[-1]
+        if active_events:
+            latest_event = active_events[-1]
             return {
                 "detected": True,
                 "severity": "medium",
@@ -1385,7 +1525,7 @@ class PacketSniffer:
         return {
             "detected": False,
             "severity": "none",
-            "description": "No HTTP requests to known HTTPS domains have been observed.",
+            "description": "No HTTP requests to known HTTPS domains have been observed in this session.",
             "events": events,
         }
 

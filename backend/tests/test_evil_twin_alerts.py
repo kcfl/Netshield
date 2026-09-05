@@ -14,13 +14,18 @@ from capture.sniffer import PacketSniffer  # noqa: E402
 from services.alert_service import AlertService  # noqa: E402
 
 
-def _build_sniffer_with_access_points(access_points):
+def _build_sniffer_with_access_points(access_points, connected_ssid=None):
     """Create a PacketSniffer with a pre-populated AP map for deterministic tests."""
     sniffer = PacketSniffer()
     sniffer._access_points = {ap["bssid"]: dict(ap) for ap in access_points}
     sniffer._ssid_index = defaultdict(set)
     for ap in access_points:
         sniffer._ssid_index[ap["ssid"]].add(ap["bssid"])
+    # Evil-twin evaluation only covers the SSID we are connected to, so a test
+    # sniffer that never connects produces no groups at all.
+    if connected_ssid is None and access_points:
+        connected_ssid = access_points[0]["ssid"]
+    sniffer._connected_ssid = connected_ssid
     sniffer._refresh_evil_twin_flags_locked()
     return sniffer
 
